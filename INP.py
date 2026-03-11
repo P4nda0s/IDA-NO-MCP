@@ -1,5 +1,6 @@
 # ida_export_for_ai.py
 # IDA Plugin to export decompiled functions, strings, memory, imports and exports for AI analysis
+# Compatible with IDA 9.0+
 
 import os
 import sys
@@ -15,12 +16,24 @@ import idc
 import ida_auto
 import ida_kernwin
 import ida_idaapi
-import ida_undo
-import ida_idp
+import ida_ida
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import multiprocessing as mp
+
+# Conditionally import modules that may not exist in IDA 9.0
+try:
+    import ida_undo
+    HAS_IDA_UNDO = True
+except ImportError:
+    HAS_IDA_UNDO = False
+
+try:
+    import ida_idp
+    HAS_IDA_IDP = True
+except ImportError:
+    HAS_IDA_IDP = False
 
 WORKER_COUNT = max(1, mp.cpu_count() - 1)
 TASK_BATCH_SIZE = 50
@@ -33,8 +46,11 @@ def get_idb_directory():
     """获取 IDB 文件所在目录"""
     idb_path = ida_nalt.get_input_file_path()
     if not idb_path:
-        import ida_loader
-        idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        try:
+            import ida_loader
+            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        except:
+            pass
     return os.path.dirname(idb_path) if idb_path else os.getcwd()
 
 def ensure_dir(path):
@@ -45,22 +61,25 @@ def ensure_dir(path):
 def clear_undo_buffer():
     """清理 IDA 撤销缓冲区，防止内存溢出"""
     try:
-        ida_undo.clear_undo_buffer()
+        if HAS_IDA_UNDO:
+            ida_undo.clear_undo_buffer()
         gc.collect()
     except:
         pass
 
 def disable_undo():
-    """禁用撤销功能（IDA 7.0+）"""
+    """禁用撤销功能"""
     try:
-        ida_idp.disable_undo(True)
+        if HAS_IDA_IDP and hasattr(ida_idp, 'disable_undo'):
+            ida_idp.disable_undo(True)
     except:
         pass
 
 def enable_undo():
     """启用撤销功能"""
     try:
-        ida_idp.disable_undo(False)
+        if HAS_IDA_IDP and hasattr(ida_idp, 'disable_undo'):
+            ida_idp.disable_undo(False)
     except:
         pass
 
@@ -223,11 +242,10 @@ def export_decompiled_functions(export_dir, skip_existing=True):
     
     def aggressive_memory_cleanup():
         """激进的内存清理"""
-        # 强制删除大对象引用
-        import sys
-        # 清理IDA内部缓存
+        # 清理IDA Hex-Rays内部缓存
         try:
-            ida_hexrays.clear_cached_cfuncs()
+            if hasattr(ida_hexrays, 'clear_cached_cfuncs'):
+                ida_hexrays.clear_cached_cfuncs()
         except:
             pass
         # 强制垃圾回收
@@ -825,16 +843,26 @@ def PLUGIN_ENTRY():
 
 if __name__ == "__main__":
     # 支持作为独立脚本运行（用于批处理模式）
-    argc = int(idc.eval_idc("ARGV.count"))
-    if argc < 2:
-        export_dir = None
-        skip_analysis = False
-    elif argc < 3:
-        export_dir = idc.eval_idc("ARGV[1]")
-        skip_analysis = False
-    else:
-        export_dir = idc.eval_idc("ARGV[1]")
-        skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
+    # IDA 9.0 兼容的参数获取方式
+    export_dir = None
+    skip_analysis = False
+    
+    try:
+        # 优先使用 idc.ARGV（IDA 9.0+ 推荐方式）
+        if hasattr(idc, 'ARGV') and idc.ARGV is not None and len(idc.ARGV) > 1:
+            export_dir = idc.ARGV[1]
+            if len(idc.ARGV) > 2:
+                skip_analysis = (idc.ARGV[2] == "1")
+        else:
+            # 回退到 eval_idc 方式（旧版 IDA 兼容）
+            argc = int(idc.eval_idc("ARGV.count"))
+            if argc >= 2:
+                export_dir = idc.eval_idc("ARGV[1]")
+            if argc >= 3:
+                skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
+    except:
+        # 如果参数获取失败，使用默认值
+        pass
 
     # 批处理模式不询问用户
     do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis)
