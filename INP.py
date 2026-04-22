@@ -59,6 +59,21 @@ def get_idb_directory():
     return os.path.dirname(idb_path) if idb_path else os.getcwd()
 
 
+def get_default_export_dir():
+    """默认导出目录：`原文件名.扩展名_export_for_ai`。"""
+    input_path = ida_nalt.get_input_file_path()
+    if not input_path:
+        try:
+            import ida_loader
+            input_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        except Exception:
+            input_path = None
+
+    base_dir = os.path.dirname(input_path) if input_path else os.getcwd()
+    file_name = os.path.basename(input_path) if input_path else "input.bin"
+    return os.path.join(base_dir, "{}_export_for_ai".format(file_name))
+
+
 def ensure_dir(path):
     """确保目录存在"""
     if not os.path.exists(path):
@@ -645,6 +660,70 @@ class _FuncExportJob(object):
 
         return self.TIMER_INTERVAL_MS
 
+    def run_blocking(self, show_dialog=False):
+        """阻塞式运行，用于 `idat -A -S...` 批处理模式。"""
+        global _active_export_job
+        _active_export_job = self
+        self._start_time = time.time()
+        self._job_start_time = self._start_time
+
+        try:
+            if not self._lazy_init():
+                logger.info("All functions already exported!")
+                enable_undo()
+                _active_export_job = None
+                return
+
+            self._initialized = True
+
+            while self.idx < len(self.remaining_funcs):
+                self._collect_done_futures()
+
+                func_ea = self.remaining_funcs[self.idx]
+                self.idx += 1
+
+                self._current_func_ea = func_ea
+                self._current_func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+                self._current_func_start_time = time.time()
+
+                self._process_one(func_ea)
+
+                func_elapsed = time.time() - self._current_func_start_time
+                self._last_func_name = self._current_func_name
+                self._last_func_time = func_elapsed
+                self._current_func_name = None
+                self._current_func_ea = None
+
+                if self.idx % 50 == 0:
+                    self._flush_all_pending(wait=False)
+                    save_progress(self.export_dir, self.processed_addrs,
+                                  self.fallback_funcs, self.failed_funcs, self.skipped_funcs)
+                    logger.info("Progress: %d/%d functions", self.idx, len(self.remaining_funcs))
+
+                if self.idx % 500 == 0:
+                    clear_undo_buffer()
+                    try:
+                        if ida_hexrays:
+                            ida_hexrays.clear_cached_cfuncs()
+                    except Exception:
+                        pass
+                    gc.collect()
+
+            self._finish(cancelled=False, show_dialog=show_dialog)
+        except Exception:
+            try:
+                if self.io_executor is not None:
+                    self._flush_all_pending(wait=True)
+                    self.io_executor.shutdown(wait=True)
+            except Exception:
+                pass
+            clear_processing(self.export_dir)
+            save_progress(self.export_dir, self.processed_addrs,
+                          self.fallback_funcs, self.failed_funcs, self.skipped_funcs)
+            enable_undo()
+            _active_export_job = None
+            raise
+
     # ------------------------------------------------------------------
     # 单函数处理（在主线程中，IDA API 完全安全）
     # ------------------------------------------------------------------
@@ -827,7 +906,7 @@ class _FuncExportJob(object):
     # 完成和日志
     # ------------------------------------------------------------------
 
-    def _finish(self, cancelled):
+    def _finish(self, cancelled, show_dialog=True):
         """等待 I/O 完成，写日志，显示完成对话框。在主线程中调用，完全安全。"""
         global _active_export_job
 
@@ -865,24 +944,25 @@ class _FuncExportJob(object):
         # 清理全局引用
         _active_export_job = None
 
-        # 显示完成对话框（在主线程直接调用，完全安全）
-        if cancelled:
-            title = "Export Cancelled"
-        else:
-            title = "Export Completed"
+        if show_dialog:
+            # 显示完成对话框（在主线程直接调用，完全安全）
+            if cancelled:
+                title = "Export Cancelled"
+            else:
+                title = "Export Completed"
 
-        elapsed = time.time() - self._job_start_time
-        elapsed_str = "{:d}m {:02d}s".format(int(elapsed) // 60, int(elapsed) % 60)
+            elapsed = time.time() - self._job_start_time
+            elapsed_str = "{:d}m {:02d}s".format(int(elapsed) // 60, int(elapsed) % 60)
 
-        summary = ("{}\n\n"
-                   "Exported : {}  |  Fallback : {}  |  Failed : {}\n"
-                   "Skipped  : {}  |  Time: {}\n\n"
-                   "Output: {}").format(
-            title,
-            self.exported_funcs, len(self.fallback_funcs),
-            len(self.failed_funcs), len(self.skipped_funcs),
-            elapsed_str, self.export_dir)
-        ida_kernwin.info(summary)
+            summary = ("{}\n\n"
+                       "Exported : {}  |  Fallback : {}  |  Failed : {}\n"
+                       "Skipped  : {}  |  Time: {}\n\n"
+                       "Output: {}").format(
+                title,
+                self.exported_funcs, len(self.fallback_funcs),
+                len(self.failed_funcs), len(self.skipped_funcs),
+                elapsed_str, self.export_dir)
+            ida_kernwin.info(summary)
 
     def _write_logs(self):
         ed = self.export_dir
@@ -1006,6 +1086,19 @@ def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=F
         except Exception:
             pass
         _active_export_job = None
+
+
+def export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=False):
+    """阻塞式导出函数，用于批处理模式。"""
+    ensure_dir(os.path.join(export_dir, "decompile"))
+    ensure_dir(os.path.join(export_dir, "disassembly"))
+
+    job = _FuncExportJob(
+        export_dir=export_dir,
+        skip_existing=skip_existing,
+        force_reexport=force_reexport,
+    )
+    job.run_blocking(show_dialog=False)
 
 
 def export_strings(export_dir):
@@ -2116,8 +2209,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     disable_undo()
 
     if export_dir is None:
-        idb_dir = get_idb_directory()
-        default_export_dir = os.path.join(idb_dir, "export-for-ai")
+        default_export_dir = get_default_export_dir()
 
         if ask_user:
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
@@ -2167,6 +2259,56 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         return
 
 
+def do_export_sync(export_dir=None, skip_auto_analysis=False, worker_count=None, force_reexport=False):
+    """同步阻塞导出，适用于 `idat -A -S...` 批处理模式。"""
+    global WORKER_COUNT
+
+    if worker_count is not None:
+        WORKER_COUNT = max(1, worker_count)
+
+    logger.info("=" * 60)
+    logger.info("IDA Export for AI Analysis (blocking batch mode)")
+    logger.info("=" * 60)
+    logger.info("Using %d worker threads for parallel I/O", WORKER_COUNT)
+
+    clear_undo_buffer()
+    disable_undo()
+
+    try:
+        if export_dir is None:
+            export_dir = get_default_export_dir()
+
+        ensure_dir(export_dir)
+        logger.info("Export directory: %s", export_dir)
+
+        if not skip_auto_analysis:
+            logger.info("Waiting for auto-analysis to complete...")
+            ida_auto.auto_wait()
+            logger.info("Auto-analysis completed")
+
+        if ida_hexrays is None:
+            logger.warning("ida_hexrays module not available, decompilation will fall back to disassembly")
+        else:
+            try:
+                if ida_hexrays.init_hexrays_plugin():
+                    logger.info("Hex-Rays decompiler initialized")
+                else:
+                    logger.warning("Hex-Rays decompiler not available, decompilation will fall back to disassembly")
+            except Exception as e:
+                logger.warning("Failed to initialize Hex-Rays: %s", str(e))
+
+        export_strings(export_dir)
+        export_imports(export_dir)
+        export_exports(export_dir)
+        export_pointers(export_dir)
+        export_memory(export_dir)
+        export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=force_reexport)
+
+        logger.info("Blocking export completed: %s", export_dir)
+    finally:
+        enable_undo()
+
+
 # ============================================================================
 # Plugin Class (plugmod_t pattern, recommended by IDA 9.x)
 # ============================================================================
@@ -2195,8 +2337,7 @@ class ExportForAIPlugmod(ida_idaapi.plugmod_t):
                 return
 
             # 显示默认导出目录，让用户选择模式
-            idb_dir = get_idb_directory()
-            default_dir = os.path.join(idb_dir, "export-for-ai")
+            default_dir = get_default_export_dir()
 
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
                                         "Export for AI Analysis\n\n"
@@ -2260,8 +2401,8 @@ if __name__ == "__main__":
         export_dir = _idc.eval_idc("ARGV[1]")
         skip_analysis = (_idc.eval_idc("ARGV[2]") == "1")
 
-    # 批处理模式不询问用户
-    do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis)
+    # 批处理模式改用同步导出，确保所有文件写完后再退出
+    do_export_sync(export_dir, skip_auto_analysis=skip_analysis)
 
     # 只在批处理模式下退出
     if argc >= 2:
